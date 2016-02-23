@@ -22,8 +22,10 @@
 #include "tttp_scancodes.h"
 #include "lsx.h"
 
+// The queue depth to use if we don't receive a 'Queu' message
 #define DEFAULT_QUEUE_DEPTH 5
 
+// Authentication stuff
 static const char* master_username = NULL;
 static uint8_t master_salt[TTTP_SALT_LENGTH];
 static uint8_t guest_salt[TTTP_SALT_LENGTH];
@@ -33,29 +35,90 @@ static uint8_t fake_verifier_generator[SHA256_HASHBYTES];
 static uint8_t public_key[TTTP_PUBLIC_KEY_LENGTH];
 static uint8_t private_key[TTTP_PRIVATE_KEY_LENGTH];
 
-static void* handle;
-
+// Our fake display surface
 static SDL_Surface* screen = NULL;
 
-struct dfcontext {
+// The frame number of the current frame, and of the most recent frame that has
+// been sent to at least one master
+static Uint64 frame = 0, master_synced_frame = 0;
+
+// Buffers and info for the decoded display
+static uint8_t* term_buffer, *term_colors, *term_chars;
+static Uint16 cols, rows;
+
+// Most recently requested delay and interval for key repeat
+static int kd = 0, ki = 0;
+
+// PTH events used to reduce CPU usage
+static pth_event_t masterframe_event, no_first_context_event;
+
+// The PTH thread that handles incoming connections
+static pth_t listen_tid;
+
+// The key used to access the libtttp thread-local storage block
+static pth_key_t thread_local_key;
+
+// The socket on which we're listening for incoming connections
+static int listen_socket = -1;
+
+// Palette stuff
+#define PALETTE_MAX 16 // built into the TTTP protocol now
+// The palette, as 32-bit pixels
+static Uint32 palette_packed[PALETTE_MAX];
+// The palette, in the wire format used by TTTP
+static Uint8 palette_unpacked[PALETTE_MAX*3];
+// The number of currently-active colors in the palette
+static int palette_count = 0;
+
+// A "tttpcontext" struct contains all the state information associated with a
+// given TTTP connection.
+struct tttpcontext {
+  // The PTH thread corresponding to this connection
   pth_t tid;
+  // The libtttp context for this connection
   tttp_server* tttp;
+  // The socket for this connection
   int sock;
-  int queued_frames, inflight_frames, synced_kd, synced_ki;
-  uint32_t sendbuf_head, sendbuf_tail;
+  // The number of open queue slots for frames
+  int queued_frames;
+  // The number of occupied queue slots for frames
+  int inflight_frames;
+  // The values for repeat delay and interval that are active
+  int synced_kd, synced_ki;
+  // The modifier keys currently active
   SDLMod cur_mods;
+  // The X and Y location of the mouse
   int cur_mouse_x, cur_mouse_y;
+  // The mouse buttons currently active
   Uint8 cur_mouse_buttons;
-  int8_t is_master; int8_t synced_palette_count; int8_t in_main_loop;
+  // 0 if this is a guest connection, 1 if it's a master connection,
+  // -1 if it's an incomplete connection with a wrong username
+  int8_t is_master;
+  // The number of colors that were in the palette last time we sent a frame
+  // (if it has changed, we know we need to send a new palette)
+  int8_t synced_palette_count;
+  // 0 if the connection is handshaking, 1 if it's complete
+  // (used to decide whether we should interrupt a read to post a frame)
+  int8_t in_main_loop;
+  // A PTH event ring containing an event that triggers if a new frame becomes
+  // available
   pth_event_t newframe_event;
+  // The frame number of the last frame that was queued
   Uint64 synced_frame;
+  // A ring buffer that contains the data to be sent over this connection
+  uint32_t sendbuf_head, sendbuf_tail;
   uint8_t sendbuf[1024];
-  struct dfcontext* next;
-  struct dfcontext* prev;
+  // tttpcontexts are members of a doubly-linked list
+  struct tttpcontext* next;
+  struct tttpcontext* prev;
 };
 
+// The anchor for the list of active contexts
+static struct tttpcontext* first_context = NULL;
+
+// The libtttp callback to flush all buffered data on this connection
 static void flush_data(void* _data) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
   if(this->sock < 0) return;
   while(this->sendbuf_head > this->sendbuf_tail) {
     ssize_t did = pth_write(this->sock, this->sendbuf + this->sendbuf_tail,
@@ -75,8 +138,9 @@ static void flush_data(void* _data) {
   this->sendbuf_tail = this->sendbuf_head = 0;  
 }
 
+// The libtttp callback to send some data over this connection
 static int send_data(void* _data, const void* buf, size_t bufsz) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
   if(this->sock < 0) return -1;
   if(this->sendbuf_head >= sizeof(this->sendbuf)) flush_data(_data);
   if(this->sock < 0) return -1;
@@ -109,8 +173,9 @@ static int send_data(void* _data, const void* buf, size_t bufsz) {
   }
 }
 
+// The libtttp callback to receive data over this connection
 static int recv_data(void* _data, void* buf, size_t bufsz) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
   if(this->sock < 0) return -1;
   ssize_t did = pth_read_ev(this->sock, buf, bufsz,
                             this->in_main_loop ? this->newframe_event : NULL);
@@ -128,27 +193,25 @@ static int recv_data(void* _data, void* buf, size_t bufsz) {
   else return did;
 }
 
+// The libtttp callback used when an unrecoverable error occurs
 static void fatal_error(void* _data, const char* why) {
   fprintf(stderr, "libtttp fatal error: %s\n", why);
   fflush(stderr);
   abort();
 }
 
-static Uint64 frame = 0, master_synced_frame = 0;
-static uint8_t* term_buffer, *term_colors, *term_chars;
-static Uint16 cols, rows;
-
+// Used to create a PTH event that triggers when a new frame is posted AND this
+// client has a frame queued
 static int wait_until_new_frame(void* _data) {
-  struct dfcontext* this = (struct dfcontext*)_data;
-  return this->synced_frame != frame;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  return this->queued_frames > 0 && this->synced_frame != frame;
 }
 
-static struct dfcontext* first_context = NULL;
-static void* client_thread(struct dfcontext* this);
+// A currently-unused debug function that dumps the context list
 static void print_contexts() {
   int n = 0;
   fprintf(stderr, "Starting at first_context\n");
-  for(struct dfcontext* p = first_context; p; p = p->next) {
+  for(struct tttpcontext* p = first_context; p; p = p->next) {
     if(++n > 10) {
       fprintf(stderr, "...\n");
       break;
@@ -157,8 +220,14 @@ static void print_contexts() {
   }
   fflush(stderr);
 }
-static struct dfcontext* newcontext(int sock) {
-  struct dfcontext* new = malloc(sizeof(struct dfcontext));
+
+// (forward declaration for newcontext's benefit)
+static void* client_thread(struct tttpcontext* this);
+// Creates a new tttpcontext for a new incoming connection. This includes
+// spawning the PTH thread for that context.
+// The context must later be destroyed with deletecontext.
+static struct tttpcontext* newcontext(int sock) {
+  struct tttpcontext* new = malloc(sizeof(struct tttpcontext));
   new->sock = sock;
   new->tttp = tttp_server_init(new,
                                recv_data,
@@ -190,9 +259,14 @@ static struct dfcontext* newcontext(int sock) {
   //print_contexts();
   return new;
 }
+// forward declarations for deletecontext's benefit
 static void handle_Kbtn(void*, int, uint16_t);
 static void handle_Mbtn(void* _data, int pressed, uint16_t button);
-static void deletecontext(struct dfcontext* ctx) {
+// Cleans up the state for a given context. If its thread is still running,
+// remedies that situation. If its thread is the running thread, this cleanly
+// ends the thread's execution.
+static void deletecontext(struct tttpcontext* ctx) {
+  // Any modifiers that were held, explicitly release.
   if(ctx->cur_mods & KMOD_LSHIFT) handle_Kbtn(ctx, 0, KEY_LEFT_SHIFT);
   if(ctx->cur_mods & KMOD_RSHIFT) handle_Kbtn(ctx, 0, KEY_RIGHT_SHIFT);
   if(ctx->cur_mods & KMOD_LCTRL) handle_Kbtn(ctx, 0, KEY_LEFT_CONTROL);
@@ -203,6 +277,7 @@ static void deletecontext(struct dfcontext* ctx) {
   if(ctx->cur_mods & KMOD_RMETA) handle_Kbtn(ctx, 0, KEY_RIGHT_GUI);
   if(ctx->cur_mods & KMOD_NUM) handle_Kbtn(ctx, 0, KEY_NUM_LOCK);
   if(ctx->cur_mods & KMOD_CAPS) handle_Kbtn(ctx, 0, KEY_CAPS_LOCK);
+  // Likewise any mouse buttons.
   if(ctx->cur_mouse_buttons & SDL_BUTTON_LMASK)
     handle_Mbtn(ctx, 0, TTTP_LEFT_MOUSE_BUTTON);
   if(ctx->cur_mouse_buttons & SDL_BUTTON_MMASK)
@@ -213,15 +288,21 @@ static void deletecontext(struct dfcontext* ctx) {
     handle_Mbtn(ctx, 0, TTTP_EXTENDED_MOUSE_BUTTON(0));
   if(ctx->cur_mouse_buttons & SDL_BUTTON_X2)
     handle_Mbtn(ctx, 0, TTTP_EXTENDED_MOUSE_BUTTON(1));
+  // Make sure any outstanding data gets sent out, if possible, then close the
+  // socket.
   flush_data(ctx);
   close(ctx->sock);
+  // Clean up the libtttp context.
   tttp_server_fini(ctx->tttp);
+  // Remove ourselves from the context list, as we are no longer valid.
   if(ctx->next) ctx->next->prev = ctx->prev;
   if(ctx->prev) ctx->prev->next = ctx->next;
   else if(ctx == first_context) first_context = ctx->next;
   else
     fprintf(stderr, "orphaned context? incoming double free...\n");
+  // Free our PTH event ring
   pth_event_free(ctx->newframe_event, PTH_FREE_ALL);
+  // and now, final cleanup... terminate the thread, free the memory
   pth_t tid = ctx->tid;
   free(ctx);
   if(tid != pth_self()) {
@@ -234,38 +315,23 @@ static void deletecontext(struct dfcontext* ctx) {
   }
 }
 
-static int kd = 0, ki = 0;
-
-static void dfstream3_constructor() __attribute__((constructor));
-static void dfstream3_constructor() {
-  handle = dlopen("/usr/lib/i386-linux-gnu/libSDL-1.2.so.0", RTLD_GLOBAL);
-  if(!handle) {
-    perror("/usr/lib/i386-linux-gnu/libSDL-1.2.so.0");
-    fflush(stderr);
-    abort();
-  }
-  tttp_init();
-}
-
+// Used to create a PTH event that triggers when at least one master has caught
+// up with display
 static int wait_until_master_in_sync(void* unused) {
   (void)unused;
   return master_synced_frame == frame;
 }
 
+// Used to create a PTH event that triggers when there are no active contexts
+// anymore (so we can use a raw, blocking "accept" and not waste CPU when there
+// is nobody watching)
 static int wait_until_no_first_context(void* unused) {
   (void)unused;
   return first_context == NULL;
 }
 
-static pth_event_t masterframe_event, no_first_context_event;
-
-static int listen_socket = -1;
-
-/* FIXME: for dynamic palettes up to 16 colors, and for stuff */
-#define PALETTE_MAX 16
-static Uint32 palette_packed[PALETTE_MAX];
-static Uint8 palette_unpacked[PALETTE_MAX*3];
-static int palette_count = 0;
+// Takes a raw 32-bit pixel and returns its color in the palette. If it wasn't
+// found in the palette, inserts it and returns that value.
 static Uint8 getcolor(Uint32 c) {
   int top = palette_count, bot = 0;
   while(top > bot) {
@@ -293,15 +359,22 @@ static Uint8 getcolor(Uint32 c) {
   return top;
 }
 
-static pth_t listen_tid;
+// The worker function that handles incoming connections
 static void* listen_thread(void* _) {
   (void)_;
   while(1) {
     int peer_socket;
+    // If at least one person is watching us, we use the PTH function; it will
+    // block this "thread" until someone connects, OR the last person
+    // disconnects.
+    // If nobody is watching us, we use the raw function; it will effectively
+    // block the process until somebody connects, thus avoiding wasting CPU on
+    // stuff nobody will see.
     if(first_context) peer_socket = pth_accept_ev(listen_socket, NULL, NULL, no_first_context_event);
     else peer_socket = accept(listen_socket, NULL, NULL);
     if(peer_socket >= 0) {
       int one = 1;
+      // Disable Nagle's algorithm on this socket. We manage our own buffer.
       setsockopt(peer_socket, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
       newcontext(peer_socket);
     }
@@ -309,8 +382,8 @@ static void* listen_thread(void* _) {
   }
 }
 
-static pth_key_t thread_local_key;
-
+// This function is required by libtttp, so it can have a thread-local storage
+// block, so it can handle GMP errors in a sane manner
 tttp_thread_local_block* tttp_get_thread_local_block() {
   void* ret = pth_key_getdata(thread_local_key);
   if(!ret) {
@@ -320,8 +393,11 @@ tttp_thread_local_block* tttp_get_thread_local_block() {
   return (tttp_thread_local_block*)ret;
 }
 
+// This function is called at least once per Flip. Its job is to perform
+// initialization as needed. It fully replaces the old constructor.
 static void init() {
   if(master_username == NULL) {
+    tttp_init();
     master_username = getenv("DFSTREAM3_MASTER_USERNAME");
     const char* master_password_env = getenv("DFSTREAM3_MASTER_PASSWORD");
     const char* master_verifier_env = getenv("DFSTREAM3_MASTER_VERIFIER");
@@ -463,30 +539,40 @@ static void init() {
   }
 }
 
+// The flagfilter callback for libtttp. The only flag we support is encryption.
 static uint32_t flagfilter(uint32_t inflags) {
   return inflags & TTTP_FLAG_ENCRYPTION;
 }
 
+// Called whenever the client acknowledges receiving a frame;
 static void handle_ONES(void* _data) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // If we knew we had sent this client a frame, we queue another one.
   if(this->inflight_frames > 0) {
     --this->inflight_frames;
     ++this->queued_frames;
   }
 }
 
+// Called when the client requests a specific queue depth. To the degree
+// possible, we honor this.
 static void handle_Queu(void* _data, uint8_t new_depth) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
   if(!new_depth) new_depth = DEFAULT_QUEUE_DEPTH;
   this->queued_frames = new_depth - this->inflight_frames;
 }
 
+// Called when the client presses or releases a key.
 static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // Only masters may press keys.
   if(!this->is_master) return;
   SDL_Event evt;
+  // Control-9 is a special key combination that kills Dwarf Fortress, in case
+  // of game-breaking bugs or (some) hangs.
   if((this->cur_mods & KMOD_CTRL) && scancode == KEY_9)
     kill(getpid(), SIGKILL);
+  // Simulate a KEYDOWN or KEYUP event appropriately
   evt.type = pressed ? SDL_KEYDOWN : SDL_KEYUP;
   evt.key.keysym.mod = this->cur_mods;
   evt.key.keysym.scancode = 0;
@@ -506,6 +592,9 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
       evt.key.keysym.sym = scancode;
   }
   else {
+    // We must manually map any non-ASCII scancodes to their SDL equivalents.
+    // I'm pretty sure this list is complete, at least in terms of keys that
+    // matter in DF.
     switch(scancode) {
     case KEY_F1: evt.key.keysym.sym = SDLK_F1; break;
     case KEY_F2: evt.key.keysym.sym = SDLK_F2; break;
@@ -597,6 +686,9 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
       evt.key.keysym.sym = SDLK_CAPSLOCK;
       break;
     default:
+      // TTTP supports many scancodes that have no analogs in SDL 1.2. We
+      // "support" them by sending a keyboard event with a zero "sym" and
+      // nonzero scancode. I don't think DF can use these, but...
       evt.key.keysym.scancode = scancode - 128;
       evt.key.keysym.sym = 0;
     }
@@ -604,6 +696,11 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
   if(SDL_PeepEvents(&evt, 1, SDL_ADDEVENT, 0)!=1) fprintf(stderr, "%s\n", SDL_GetError());
 }
 
+// A table mapping CP437 codepoints to Unicode ones. Unicode codepoints can't
+// all fit in 16 bits... but we use 16 because:
+// - All CP437 codepoints are mapped to Unicode code points in the BMP (i.e.
+// ones that fit in 16 bits)
+// - SDL 1.2 only supports 16 bit codepoints anyway
 static const uint16_t codepoint_table[256] = {
   0x0000, 0x263a, 0x263b, 0x2665, 0x2666, 0x2663, 0x2660, 0x2022,
   0x25d8, 0x25cb, 0x25d9, 0x2642, 0x2640, 0x266a, 0x266b, 0x263c,
@@ -639,39 +736,55 @@ static const uint16_t codepoint_table[256] = {
   0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0,
 };
 
+// Called when the client sends textual input.
 static void handle_Text(void* _data, const uint8_t* text, size_t len) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // Only masters may type!
   if(!this->is_master) return;
+  // We simulate a keydown event (no corresponding keyup) with a zero sym and
+  // scancode, for each character typed.
   SDL_Event evt;
   evt.type = SDL_KEYDOWN;
   evt.key.keysym.mod = this->cur_mods;
   evt.key.keysym.sym = 0;
   evt.key.keysym.scancode = 0;
+  // We don't use libtttp in Unicode mode, so the text is in CP437. Translation
+  // to Unicode is trivial.
   for(const uint8_t* p = text; p < text + len; ++p) {
     evt.key.keysym.unicode = codepoint_table[*p];
     if(SDL_PeepEvents(&evt, 1, SDL_ADDEVENT, 0)!=1) fprintf(stderr, "%s\n", SDL_GetError());
   }
 }
 
+// Called when the client moves the mouse.
 static void handle_Mous(void* _data, int16_t x, int16_t y) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // Only masters may mouse!
   if(!this->is_master) return;
   // TODO: highlights
+  // We simulate a MOUSEMOTION event appropriately.
   SDL_Event evt;
   evt.type = SDL_MOUSEMOTION;
   evt.motion.state = this->cur_mouse_buttons;
-  evt.motion.x = x;
+  // One bitfont cell is 10 pixels wide, but TTTP gives us mouse coordinates in
+  // character cells
+  evt.motion.x = x * 10;
   evt.motion.y = y;
-  evt.motion.xrel = x - this->cur_mouse_x;
+  evt.motion.xrel = x * 10 - this->cur_mouse_x;
   evt.motion.yrel = y - this->cur_mouse_y;
+  this->cur_mouse_x = x * 10;
+  this->cur_mouse_y = y;
   if(SDL_PeepEvents(&evt, 1, SDL_ADDEVENT, 0)!=1) fprintf(stderr, "%s\n", SDL_GetError());
 }
 
 static void handle_Mbtn(void* _data, int pressed, uint16_t button) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // ONLY MASTERS MAY MOUSE!
   if(!this->is_master) return;
   // TODO: highlights
+  // We simulate a MOUSEBUTTONDOWN or MOUSEBUTTONUP event.
   SDL_Event evt;
+  // Map TTTP button indices to SDL button indices
   switch(button) {
   case TTTP_LEFT_MOUSE_BUTTON:
     evt.button.button = SDL_BUTTON_LEFT;
@@ -695,16 +808,25 @@ static void handle_Mbtn(void* _data, int pressed, uint16_t button) {
   evt.button.x = this->cur_mouse_x;
   evt.button.y = this->cur_mouse_y;
   if(SDL_PeepEvents(&evt, 1, SDL_ADDEVENT, 0)!=1) fprintf(stderr, "%s\n", SDL_GetError());
+  // Keep track of pressed mouse buttons for future MOUSEMOTION events
   if(pressed)
     this->cur_mouse_buttons |= SDL_BUTTON(1<<evt.button.button);
   else
     this->cur_mouse_buttons &= ~SDL_BUTTON(1<<evt.button.button);
 }
 
+// Called when the client scrolls, with a mousewheel or other scrolling device
 static void handle_Scrl(void* _data, int8_t x, int8_t y) {
-  struct dfcontext* this = (struct dfcontext*)_data;
+  struct tttpcontext* this = (struct tttpcontext*)_data;
+  // ONLY MASTERS MAY SCROLL! Peasants must use clay tablets.
   if(!this->is_master) return;
+  // We only care about Y-axis scrolling. SDL 1.2 has no concept of X-axis
+  // scrolling.
   if(y != 0) {
+    // We simulate MOUSEBUTTONDOWN and MOUSEBUTTONUP events as appropriate,
+    // one for each "tick" of scrolling. We give the up event even though SDL
+    // may not do this for real scroll wheels. Why? Because doing things right
+    // is worth a few extra lines of code.
     SDL_Event evt;
     evt.button.button = y < 0 ? SDL_BUTTON_WHEELUP : SDL_BUTTON_WHEELDOWN;
     evt.button.x = this->cur_mouse_x;
@@ -722,8 +844,12 @@ static void handle_Scrl(void* _data, int8_t x, int8_t y) {
   }
 }
 
-static void* client_thread(struct dfcontext* this) {
+// The beef! This function handles one client, starting with the handshake and
+// proceeding until disconnection.
+static void* client_thread(struct tttpcontext* this) {
+  // Initial handshake!
   {
+    // These variables are only used during the handshake
     tttp_handshake_result res;
     uint8_t* neg_username;
     size_t neg_usernamelen;
@@ -740,22 +866,30 @@ static void* client_thread(struct dfcontext* this) {
       default: break;
       }
     } while(res != TTTP_HANDSHAKE_ADVANCE);
-    if(neg_username == NULL)
+    if(neg_username == NULL) {
+      // Authentication is not being used. We accept that. This connection is
+      // only allowed to spectate.
+      this->is_master = 0;
       tttp_server_accept_no_auth(this->tttp);
+    }
     else {
+      // Authentication is being used. This gets hairy...
       uint8_t valid_verifier[TTTP_VERIFIER_LENGTH];
       uint8_t valid_salt[TTTP_SALT_LENGTH];
       if(!strcmp((const char*)neg_username, master_username)) {
+        // They're connecting under master's username
         memcpy(valid_verifier, master_verifier, TTTP_VERIFIER_LENGTH);
         memcpy(valid_salt, master_salt, TTTP_SALT_LENGTH);
         this->is_master = 1;
       }
       else if(neg_usernamelen == 0) {
+        // They're connecting with a blank username
         memcpy(valid_verifier, guest_verifier, TTTP_VERIFIER_LENGTH);
         memcpy(valid_salt, guest_salt, TTTP_SALT_LENGTH);
         this->is_master = 0;
       }
       else {
+        // They're connecting with another username... reject!
         this->is_master = -1;
         lsx_sha256_context sha256;
         lsx_setup_sha256(&sha256);
@@ -764,7 +898,8 @@ static void* client_thread(struct dfcontext* this) {
         lsx_input_sha256(&sha256, neg_username, neg_usernamelen);
         lsx_finish_sha256(&sha256, valid_salt);
         lsx_destroy_sha256(&sha256);
-        // valid_verifier is uninitialized, intentionally
+        // valid_verifier is uninitialized, intentionally; its contents will
+        // not change what code path gets executed down the line
       }
       tttp_server_begin_auth(this->tttp, valid_salt, valid_verifier);
       do {
@@ -776,13 +911,16 @@ static void* client_thread(struct dfcontext* this) {
         default: break;
         }
       } while(res != TTTP_HANDSHAKE_ADVANCE && res != TTTP_HANDSHAKE_REJECTED);
-      // yes, this is a bitwise OR
+      // Yes, this is a bitwise OR. This avoids a branch, which could be used
+      // as part of a timing attack.
       if((res == TTTP_HANDSHAKE_REJECTED) | (this->is_master < 0)) {
         fflush(stderr);
         tttp_server_reject_auth(this->tttp);
         deletecontext(this);
         return NULL;
       }
+      // If we got this far, the connection was accepted! Tell the client the
+      // good news and set up all the callbacks.
       tttp_server_accept_auth(this->tttp);
       tttp_server_set_ones_callback(this->tttp, handle_ONES);
       tttp_server_set_queue_depth_callback(this->tttp, handle_Queu);
@@ -793,39 +931,59 @@ static void* client_thread(struct dfcontext* this) {
       tttp_server_set_scroll_callback(this->tttp, handle_Scrl);
     }
   }
+  // We are now in the main loop.
   this->in_main_loop = 1;
   while(this->sock >= 0) {
+    // If we have at least one slot in the queue, and a new frame is available
     if(this->queued_frames > 0 && frame != this->synced_frame) {
+      // Send the key repeat message if relevant
       if(this->synced_kd != kd || this->synced_ki != ki) {
         tttp_server_request_key_repeat(this->tttp, kd, ki);
         this->synced_kd = kd;
         this->synced_ki = ki;
       }
+      // Send the palette if the client doesn't have ours
       if(this->synced_palette_count != palette_count) {
         tttp_server_send_palette(this->tttp, palette_unpacked, palette_count);
         this->synced_palette_count = palette_count;
       }
+      // We set these values here instead of earlier or later because, at this
+      // point, we are guaranteed to get far enough to hand the current frame
+      // off to libtttp. Hopefully the palette didn't change during a silent
+      // send...
       this->synced_frame = frame;
       --this->queued_frames;
       ++this->inflight_frames;
       tttp_server_send_frame(this->tttp, cols, rows, term_buffer);
+      // Another thread needs to know when at least one master has sent a given
+      // frame
       if(this->is_master && this->synced_frame > master_synced_frame)
         master_synced_frame = this->synced_frame;
     }
+    // Do tasks related to this client.
     if(!tttp_server_pump(this->tttp)) break;
   }
+  // This thread is over. Its context no longer needs to exist.
   deletecontext(this);
 }
 
+// Our fake SetVideoMode function. It sets up a 32-bit-per-pixel surface with
+// a known pixel format, and passes it on.
 SDL_Surface* SDL_SetVideoMode(int width, int height, int bpp, Uint32 flags) {
+  // We don't try to snoop OpenGL modes.
   if(flags & SDL_OPENGL) {
     fprintf(stderr, "Please set PRINT_MODE to 2D in init/init.txt\n");
     fflush(stderr);
     abort();
   }
+  // We don't expect Dwarf Fortress to try anything but 32-bpp.
   if(bpp != 32)
-    fprintf(stderr, "BPP was %i instead of 32, something might explode\n", bpp);
+    fprintf(stderr, "BPP was %i instead of 32, something might explode\n",bpp);
+  // If we already had a display surface, we no longer care about it.
   if(screen) SDL_FreeSurface(screen);
+  // Default width and height are 800x60, corresponding to 80x60. If the
+  // requested width wasn't a multiple of 10, then either DF is stretching the
+  // font or a font other than bitfont was used. Either way, we can't continue.
   if(!width) width = 800;
   else if(width%10) {
     fprintf(stderr, "non-multiple-of-ten-width means wrong font!\n");
@@ -833,8 +991,10 @@ SDL_Surface* SDL_SetVideoMode(int width, int height, int bpp, Uint32 flags) {
     abort();
   }
   if(!height) height = 60;
+  // Create the fake surface to use
   screen = SDL_CreateRGBSurface(0, width, height, 32, 0xFF0000,0xFF00,0xFF,0);
   if(!screen) abort();
+  // Set up the buffers to store decoded frames in
   cols = width/10;
   rows = height;
   if(term_buffer) free(term_buffer);
@@ -845,23 +1005,31 @@ SDL_Surface* SDL_SetVideoMode(int width, int height, int bpp, Uint32 flags) {
   return screen;
 }
 
+// We don't ever give SDL an actual display surface, so we have to intercept
+// this call.
 SDL_Surface* SDL_DisplayFormat(SDL_Surface* src) {
   return SDL_ConvertSurface(src, screen->format, 0);
 }
 
+// The other beef! Called whenever DF is done with a frame.
 int SDL_Flip(SDL_Surface* screen) {
+  // If no masters have received the last frame, wait until one does...
   if(frame != master_synced_frame)
     pth_wait(masterframe_event);
+  // Decode the screen as displayed by DF into characters and colors.
   Uint32* srcp;
- restart: {}
+ restart: {} // Yuck.
   Uint8* dstcolor = term_colors, *dstchar = term_chars;
   int old_palette_count = palette_count;
   for(Uint16 y = 0; y < rows; ++y) {
     srcp = (Uint32*)((Uint8*)screen->pixels + y * screen->pitch);
     for(Uint16 x = 0; x < cols; ++x) {
+      // The first and second pixels of bitfont are always the foreground and
+      // background colors.
       Uint8 fg = getcolor(srcp[0]);
       Uint8 bg = getcolor(srcp[1]);
       *dstcolor++ = (fg<<4)|bg;
+      // The remaining 8 pixels are the bits of the CP437 code point.
       Uint8 chr = 0;
       if(fg != bg) {
         if(srcp[2] == srcp[0]) chr |= 128;
@@ -877,16 +1045,28 @@ int SDL_Flip(SDL_Surface* screen) {
       srcp += 10;
     }
   }
+  // If the palette count changed, some of the decoded colors are wrong. Do
+  // this to avoid one of the two causes of palette flash.
   if(palette_count != old_palette_count) goto restart;
+  // We have decoded a new frame, and through the magic of PTH this is all that
+  // is needed to notify everyone who was waiting.
   ++frame;
+  // Initialize anything that isn't already initialized. We defer proper
+  // initialization until the last possible moment to get DF started as fast as
+  // possible, in particular if a previous socket on this port is still open
+  // and we have to wait for it to close...
   init();
+  // Give other threads a chance to run. Any threads that were waiting for a
+  // new frame will run, as well as any whose IOs have become available.
   pth_yield(NULL);
+  // Our Flip always succeeds.
   return 0;
 }
 
+// Give the properties of our simulated mouse instead of any real one SDL
+// thinks it has.
 Uint8 SDL_GetMouseState(int* x, int* y) {
-  /* We won't forward mouse stuff */
-  struct dfcontext* p = first_context;
+  struct tttpcontext* p = first_context;
   while(p) {
     if(p->is_master) {
       if(x) *x = p->cur_mouse_x;
@@ -899,31 +1079,38 @@ Uint8 SDL_GetMouseState(int* x, int* y) {
   return 0;
 }
 
+// Keep track of the requested key repeat values, so the client threads can
+// distribute them appropriately.
 int SDL_EnableKeyRepeat(int delay, int interval) {
   kd = delay;
   ki = interval;
   return 0;
 }
 
+// Currently, we don't implement this. A future extension to TTTP might do
+// something here.
 void SDL_WM_SetCaption(const char* title, const char* icon) {
-  /* Don't forward this. */
   return;
 }
 
+// Currently, we don't implement this. A future extension to TTTP might do
+// something here.
 void SDL_WM_SetIcon(SDL_Surface* icon, Uint8* mask) {
-  /* Don't forward this. */
   return;
 }
 
+// Currently we don't implement a mode where Unicode translation isn't done.
 int SDL_EnableUNICODE(int enable) {
-  /* UNICODE translation always on. */
   return 1;
 }
 
+// Bypass SDL and return our fake video surface.
 SDL_Surface* SDL_GetVideoSurface() {
   return screen;
 }
 
+// Fake video info function, that tracks our fake display surface, and pretends
+// our fake 32-bpp pixel format is the native one for the screen.
 static SDL_PixelFormat vf = {NULL,32,4,0,0,0,0,16,8,0,0,255<<16,255<<8,255,0,0,0};
 static SDL_VideoInfo vi = {0,0,0,0,0,0,0,0,0,0,0,0,1024,&vf,1024,768};
 const SDL_VideoInfo* SDL_GetVideoInfo(void) {
