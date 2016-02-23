@@ -594,6 +594,16 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
       else this->cur_mods &= ~KMOD_RMETA;
       evt.key.keysym.sym = SDLK_RSUPER;
       break;
+    case KEY_NUM_LOCK:
+      if(pressed) this->cur_mods |= KMOD_NUM;
+      else this->cur_mods &= ~KMOD_NUM;
+      evt.key.keysym.sym = SDLK_NUMLOCK;
+      break;
+    case KEY_CAPS_LOCK:
+      if(pressed) this->cur_mods |= KMOD_CAPS;
+      else this->cur_mods &= ~KMOD_CAPS;
+      evt.key.keysym.sym = SDLK_CAPSLOCK;
+      break;
     default:
       evt.key.keysym.scancode = scancode - 128;
       evt.key.keysym.sym = 0;
