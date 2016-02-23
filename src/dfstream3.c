@@ -24,22 +24,6 @@
 
 #define DEFAULT_QUEUE_DEPTH 5
 
-static void set_nonblocking(int sock) {
-  //pth_fdmode(sock, PTH_FDMODE_NONBLOCK);
-  /*if(fcntl(sock, F_SETFL, O_NONBLOCK)) {
-    perror("O_NONBLOCK");
-    pth_exit(NULL);
-    }*/
-}
-
-static void set_blocking(int sock) {
-  //pth_fdmode(sock, PTH_FDMODE_BLOCK);
-  /*if(fcntl(sock, F_SETFL, 0)) {
-    perror("O_BLOCK");
-    pth_exit(NULL);
-    }*/
-}
-
 static const char* master_username = NULL;
 static uint8_t master_salt[TTTP_SALT_LENGTH];
 static uint8_t guest_salt[TTTP_SALT_LENGTH];
@@ -319,7 +303,6 @@ static void* listen_thread(void* _) {
     if(peer_socket >= 0) {
       int one = 1;
       setsockopt(peer_socket, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      set_nonblocking(peer_socket);
       newcontext(peer_socket);
     }
     else pth_yield(NULL);
@@ -476,7 +459,6 @@ static void init() {
       fflush(stderr);
       abort();
     }
-    set_nonblocking(listen_socket);
     listen_tid = pth_spawn(NULL, listen_thread, NULL);
   }
 }
