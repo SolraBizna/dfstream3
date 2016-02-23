@@ -556,42 +556,42 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
     case KEY_KEYPAD_EQUAL: evt.key.keysym.sym = SDLK_KP_EQUALS; break;
     case KEY_LEFT_CONTROL:
       if(pressed) this->cur_mods |= KMOD_LCTRL;
-      else this->cur_mods &= KMOD_LCTRL;
+      else this->cur_mods &= ~KMOD_LCTRL;
       evt.key.keysym.sym = SDLK_LCTRL;
       break;
     case KEY_RIGHT_CONTROL:
       if(pressed) this->cur_mods |= KMOD_RCTRL;
-      else this->cur_mods &= KMOD_RCTRL;
+      else this->cur_mods &= ~KMOD_RCTRL;
       evt.key.keysym.sym = SDLK_RCTRL;
       break;
     case KEY_LEFT_SHIFT:
       if(pressed) this->cur_mods |= KMOD_LSHIFT;
-      else this->cur_mods &= KMOD_LSHIFT;
+      else this->cur_mods &= ~KMOD_LSHIFT;
       evt.key.keysym.sym = SDLK_LSHIFT;
       break;
     case KEY_RIGHT_SHIFT:
       if(pressed) this->cur_mods |= KMOD_RSHIFT;
-      else this->cur_mods &= KMOD_RSHIFT;
+      else this->cur_mods &= ~KMOD_RSHIFT;
       evt.key.keysym.sym = SDLK_RSHIFT;
       break;
     case KEY_LEFT_ALT:
       if(pressed) this->cur_mods |= KMOD_LALT;
-      else this->cur_mods &= KMOD_LALT;
+      else this->cur_mods &= ~KMOD_LALT;
       evt.key.keysym.sym = SDLK_LALT;
       break;
     case KEY_RIGHT_ALT:
       if(pressed) this->cur_mods |= KMOD_RALT;
-      else this->cur_mods &= KMOD_RALT;
+      else this->cur_mods &= ~KMOD_RALT;
       evt.key.keysym.sym = SDLK_RALT;
       break;
     case KEY_LEFT_GUI:
       if(pressed) this->cur_mods |= KMOD_LMETA;
-      else this->cur_mods &= KMOD_LMETA;
+      else this->cur_mods &= ~KMOD_LMETA;
       evt.key.keysym.sym = SDLK_LSUPER;
       break;
     case KEY_RIGHT_GUI:
       if(pressed) this->cur_mods |= KMOD_RMETA;
-      else this->cur_mods &= KMOD_RMETA;
+      else this->cur_mods &= ~KMOD_RMETA;
       evt.key.keysym.sym = SDLK_RSUPER;
       break;
     default:
