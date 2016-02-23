@@ -510,9 +510,16 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
   evt.key.keysym.scancode = 0;
   evt.key.keysym.unicode = 0;
   if(scancode < 128) {
-    if(scancode == KEY_ENTER) evt.key.keysym.sym = SDLK_RETURN;
+    // ASCII keycodes!
+    // Many SDLK_* values are just the corresponding ASCII value. This maps
+    // nicely onto TTTP scancodes, with a few exceptions.
+    // SDL uses the carriage return value where TTTP uses the line feed
+    if(scancode == KEY_ENTER)
+      evt.key.keysym.sym = SDLK_RETURN;
+    // SDL uses lowercase letters where TTTP uses capital ones
     else if(scancode >= 'A' && scancode <= 'Z')
       evt.key.keysym.sym = scancode + 32;
+    // All other values map directly
     else
       evt.key.keysym.sym = scancode;
   }
