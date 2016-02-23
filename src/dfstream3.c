@@ -511,7 +511,10 @@ static void handle_Kbtn(void* _data, int pressed, uint16_t scancode) {
   evt.key.keysym.unicode = 0;
   if(scancode < 128) {
     if(scancode == KEY_ENTER) evt.key.keysym.sym = SDLK_RETURN;
-    else evt.key.keysym.sym = scancode;
+    else if(scancode >= 'A' && scancode <= 'Z')
+      evt.key.keysym.sym = scancode + 32;
+    else
+      evt.key.keysym.sym = scancode;
   }
   else {
     switch(scancode) {
