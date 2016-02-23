@@ -62,7 +62,7 @@ struct dfcontext {
   SDLMod cur_mods;
   int cur_mouse_x, cur_mouse_y;
   Uint8 cur_mouse_buttons;
-  int8_t is_master; int8_t synced_palette_count;
+  int8_t is_master; int8_t synced_palette_count; int8_t in_main_loop;
   pth_event_t newframe_event;
   Uint64 synced_frame;
   uint8_t sendbuf[1024];
@@ -72,7 +72,7 @@ struct dfcontext {
 
 static void flush_data(void* _data) {
   struct dfcontext* this = (struct dfcontext*)_data;
-  if(this->sock == -1) return;
+  if(this->sock < 0) return;
   while(this->sendbuf_head > this->sendbuf_tail) {
     ssize_t did = pth_write(this->sock, this->sendbuf + this->sendbuf_tail,
                             this->sendbuf_head - this->sendbuf_tail);
@@ -93,9 +93,9 @@ static void flush_data(void* _data) {
 
 static int send_data(void* _data, const void* buf, size_t bufsz) {
   struct dfcontext* this = (struct dfcontext*)_data;
-  if(this->sock == -1) return -1;
+  if(this->sock < 0) return -1;
   if(this->sendbuf_head >= sizeof(this->sendbuf)) flush_data(_data);
-  if(this->sock == -1) return -1;
+  if(this->sock < 0) return -1;
   if(this->sendbuf_head + bufsz <= sizeof(this->sendbuf)) {
     memcpy(this->sendbuf + this->sendbuf_head, buf, bufsz);
     this->sendbuf_head += bufsz;
@@ -104,7 +104,7 @@ static int send_data(void* _data, const void* buf, size_t bufsz) {
   else {
     while(this->sendbuf_head) {
       flush_data(_data);
-      if(this->sock == -1) return -1;
+      if(this->sock < 0) return -1;
     }
     while(bufsz > 0) {
       ssize_t did = pth_write(this->sock, buf, bufsz);
@@ -127,8 +127,9 @@ static int send_data(void* _data, const void* buf, size_t bufsz) {
 
 static int recv_data(void* _data, void* buf, size_t bufsz) {
   struct dfcontext* this = (struct dfcontext*)_data;
-  if(this->sock == -1) return -1;
-  ssize_t did = pth_read_ev(this->sock, buf, bufsz, this->newframe_event);
+  if(this->sock < 0) return -1;
+  ssize_t did = pth_read_ev(this->sock, buf, bufsz,
+                            this->in_main_loop ? this->newframe_event : NULL);
   if(did <= 0) {
     if(errno == EAGAIN && did != 0)
       return 0;
@@ -192,6 +193,7 @@ static struct dfcontext* newcontext(int sock) {
   new->synced_kd = 0;
   new->synced_ki = 0;
   new->synced_palette_count = 0;
+  new->in_main_loop = 0;
   new->cur_mods = 0;
   new->cur_mouse_buttons = 0;
   new->cur_mouse_x = 0;
@@ -789,7 +791,8 @@ static void* client_thread(struct dfcontext* this) {
       tttp_server_set_scroll_callback(this->tttp, handle_Scrl);
     }
   }
-  while(1) {
+  this->in_main_loop = 1;
+  while(this->sock >= 0) {
     if(this->queued_frames > 0 && frame != this->synced_frame) {
       if(this->synced_kd != kd || this->synced_ki != ki) {
         tttp_server_request_key_repeat(this->tttp, kd, ki);
