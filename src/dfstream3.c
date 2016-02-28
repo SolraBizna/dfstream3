@@ -876,6 +876,15 @@ static void* client_thread(struct tttpcontext* this) {
       // Authentication is being used. This gets hairy...
       uint8_t valid_verifier[TTTP_VERIFIER_LENGTH];
       uint8_t valid_salt[TTTP_SALT_LENGTH];
+      // The protocol requires us to generate a fake salt regardless of whether
+      // we will use it, to mitigate timing attacks.
+      lsx_sha256_context sha256;
+      lsx_setup_sha256(&sha256);
+      lsx_input_sha256(&sha256, fake_verifier_generator,
+                       sizeof(fake_verifier_generator));
+      lsx_input_sha256(&sha256, neg_username, neg_usernamelen);
+      lsx_finish_sha256(&sha256, valid_salt);
+      lsx_destroy_sha256(&sha256);
       if(!strcmp((const char*)neg_username, master_username)) {
         // They're connecting under master's username
         memcpy(valid_verifier, master_verifier, TTTP_VERIFIER_LENGTH);
@@ -891,13 +900,7 @@ static void* client_thread(struct tttpcontext* this) {
       else {
         // They're connecting with another username... reject!
         this->is_master = -1;
-        lsx_sha256_context sha256;
-        lsx_setup_sha256(&sha256);
-        lsx_input_sha256(&sha256, fake_verifier_generator,
-                         sizeof(fake_verifier_generator));
-        lsx_input_sha256(&sha256, neg_username, neg_usernamelen);
-        lsx_finish_sha256(&sha256, valid_salt);
-        lsx_destroy_sha256(&sha256);
+        // valid_salt already contains the generated salt for this username
         // valid_verifier is uninitialized, intentionally; its contents will
         // not change what code path gets executed down the line
       }
