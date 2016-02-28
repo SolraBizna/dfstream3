@@ -828,7 +828,7 @@ static void handle_Scrl(void* _data, int8_t x, int8_t y) {
     // may not do this for real scroll wheels. Why? Because doing things right
     // is worth a few extra lines of code.
     SDL_Event evt;
-    evt.button.button = y < 0 ? SDL_BUTTON_WHEELUP : SDL_BUTTON_WHEELDOWN;
+    evt.button.button = y > 0 ? SDL_BUTTON_WHEELUP : SDL_BUTTON_WHEELDOWN;
     evt.button.x = this->cur_mouse_x;
     evt.button.y = this->cur_mouse_y;
     if(y < 0) y = -y;
