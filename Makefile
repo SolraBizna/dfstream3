@@ -1,4 +1,4 @@
-all: dfstream3.so
+all: dfstream3_64.so
 
 %.o: %.c
 	gcc -g -m32 -fPIC -shared -std=c99 -I/usr/include/SDL/ -Ilsx/include/ -Ilibtttp/ $< -c -o $@
