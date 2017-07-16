@@ -3,4 +3,4 @@
 	url = https://github.com/SolraBizna/libtttp.git
 [submodule "lsx"]
 	path = lsx
-	url = https://github.com/SolraBizna/libtttp.git
+	url = https://github.com/SolraBizna/lsx.git
